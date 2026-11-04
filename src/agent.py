@@ -14,25 +14,16 @@ Each setting below names the skill in skills/ that explains when and how to chan
 from __future__ import annotations
 
 import asyncio
-import base64
-import html
-import io
-import json
 import logging
 import os
 import re
 import subprocess
-import sys
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -48,427 +39,64 @@ from livekit.agents.beta.tools import EndCallTool
 from livekit.plugins import assemblyai, openai, silero
 
 try:
-    # Only needed for the browser tools (YouTube, read_page), which run on your own
-    # machine. A hosted server doesn't install Playwright, and those tools are off there.
     from playwright.async_api import async_playwright
 except ImportError:
     async_playwright = None
 
-load_dotenv(Path(__file__).parents[1] / ".env.local")
+from config import (
+    AGENT_NAME,
+    APP_COMMANDS,
+    APP_COMMANDS_MAC,
+    ASSISTANT_NAME,
+    GREETING,
+    HOSTED,
+    INSTRUCTIONS,
+    LLM_GATEWAY_URL,
+    LLM_MODEL,
+    MACOS,
+    OPENROUTER_MODEL,
+    OPENROUTER_URL,
+    SITES,
+    STT_KEYTERMS,
+    STT_MODE,
+    TTS_VOICE,
+    VAD_THRESHOLD,
+)
+from helpers.email import (
+    contact_email,
+    delete_gmail_draft,
+    save_gmail_draft,
+    smtp_send,
+)
+from helpers.github import ago, github_get, parse_repo, say_count
+from helpers.search import web_search as _web_search
+from helpers.vision import ask_gemini_about_image, grab_screen_jpeg
 
 logger = logging.getLogger("agent")
-
-# Frontends, phone numbers and the Agent Console ask LiveKit for the agent by this name
-AGENT_NAME = "assistant"
-
-# --- Hosting ---
-# Set HOSTED=1 in the environment when running on a server (LiveKit Cloud, Docker, a VPS).
-# It switches OFF the tools that control THIS computer (opening apps, Spotify, YouTube,
-# reading pages) because there's no desktop on a server, and keeps the ones that work
-# anywhere (web_search and get_current_time). On your laptop, leave it unset for everything.
-HOSTED = os.getenv("HOSTED", "").strip().lower() in ("1", "true", "yes")
-
-# --- Voice: skills/tts-voice ---
-
-# A voice id from https://www.assemblyai.com/docs/tts/voices, or one of your cloned voices
-TTS_VOICE = "37e65973-9d96-5aab-adcd-01bf56ab5af9"  # Kyla
-
-# The agent introduces itself by the voice's name; if you change one, change the other
-ASSISTANT_NAME = "Kyla"
-
-# --- Speech-to-text ---
-
-# How quickly a turn ends versus how accurate the transcript is: "min_latency", "balanced"
-# or "max_accuracy". See skills/turn-detection.
-STT_MODE = "balanced"
-
-# How loud speech must be to count, for transcription and for interrupting the agent. The
-# STT and Silero use the same value. See skills/interruptions-and-vad.
-# On speakers rather than headphones, the mic picks up the agent's own voice; the echo
-# arrives quieter than real speech, so a higher bar here stops it being heard as a reply.
-# Lower it towards 0.2 if your own quiet speech gets missed.
-VAD_THRESHOLD = 0.4
-
-# Names and terms the STT should spell right. See skills/keyterms-and-prompt.
-STT_KEYTERMS = [ASSISTANT_NAME]
-
-# --- LLM: skills/llm-model ---
-
-# Any model from https://llm-gateway.assemblyai.com/v1/models that supports tools
-LLM_MODEL = "gemma-4-31b"
-LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1"
-
-# --- Web search: Firecrawl ---
-
-# web_search uses Firecrawl when FIRECRAWL_API_KEY is set in .env.local (cleaner,
-# more reliable results), and falls back to the DuckDuckGo scrape when it isn't.
-# Get a key at https://www.firecrawl.dev/app/api-keys.
-FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
-
-# --- GitHub ---
-# github_repo_summary needs no key for public repos (60 requests an hour per IP).
-# Set GITHUB_TOKEN in .env.local to raise that to 5000 an hour and to read private repos.
-GITHUB_API = "https://api.github.com"
-
-# --- Seeing the screen ---
-# look_at_screen sends a screenshot to Google's Gemini API, which needs its own free key:
-# the models on the AssemblyAI gateway's free plan don't accept images at all.
-# Get one at https://aistudio.google.com/apikey and set GEMINI_API_KEY in .env.local.
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
-GEMINI_API_REVISION = "2026-05-20"
-
-# Any flash model is liable to answer 503 "high demand" for a minute at a time, so these
-# are tried in turn, most consistently available first, and the whole list is retried once.
-GEMINI_MODELS = (
-    "gemini-2.5-flash",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
-)
-
-# A working answer takes about 8 seconds, so 30 is generous; an overloaded model refuses
-# in under a second, which is what keeps walking the whole list cheap.
-GEMINI_TIMEOUT = 30
-
-# Screenshots are shrunk to this width before upload: wide enough to read on-screen text,
-# small enough that the round trip doesn't leave a silence in the conversation.
-SCREENSHOT_WIDTH = 1600
-
-GREETING = f"Hi, I'm {ASSISTANT_NAME}. How can I help?"
-
-# How to talk is the same everywhere; what the agent can DO differs by where it runs.
-_HOW_TO_TALK = """\
-How to talk:
-- Keep each reply to one or two short sentences, and ask one question at a time.
-- Don't use lists, markdown, emojis or abbreviations that sound odd aloud.
-- When you read back a phone number, code or ID, separate every character with a space and \
-group them with commas, like "5 1 2, 5 5 5, 0 1 3 4".
-- If you didn't catch something, say so and ask again, rather than guessing.
-
-Answer questions using your own knowledge, including about people, places and topics. For \
-anything recent, changing, or that you're not sure of, call web_search and answer from the \
-results in one or two sentences, rather than guessing. Use get_current_time for the time. \
-When the person has nothing else, say a short goodbye and call end_call."""
-
-# On a laptop: the full assistant, including tools that drive this computer.
-INSTRUCTIONS_LOCAL = """\
-You are {name}, a friendly voice assistant. You're talking with someone live, and everything \
-you write is spoken aloud by a text-to-speech voice.
-
-What you do: chat about anything and answer questions, tell the time anywhere in the \
-world with get_current_time, open a song on Spotify with play_song, and play videos on \
-YouTube: play_on_youtube for a song, or play_latest_from for a channel's newest upload \
-(then pause_music, resume_music and next_song control whatever is playing). You can also \
-open programs with open_app, open websites with open_website, look things up on the \
-web with web_search, summarize a GitHub repository and its pull requests with \
-github_repo_summary, look at what's on their screen with look_at_screen, and read what's \
-on a page (including the user's email) with read_page.
-
-When they ask about "this", "my screen", an error they're seeing, or anything in front of \
-them, call look_at_screen rather than asking them to describe it.
-
-To control music, always call the tool, don't just say you did: "pause"/"stop" -> \
-pause_music, "resume"/"play"/"continue" -> resume_music, "next"/"skip" -> next_song.
-
-""" + _HOW_TO_TALK
-
-# When hosted on a server: only the tools that work anywhere. No computer to drive.
-INSTRUCTIONS_HOSTED = """\
-You are {name}, a friendly voice assistant. You're talking with someone live, and everything \
-you write is spoken aloud by a text-to-speech voice.
-
-What you do: chat about anything and answer questions, tell the time anywhere in the world \
-with get_current_time, look things up on the web with web_search, and summarize a GitHub \
-repository and its pull requests with github_repo_summary. If someone asks you to \
-open an app, play music, or control their device, explain warmly that you can't do that from \
-here, but you're happy to answer questions or look something up instead.
-
-""" + _HOW_TO_TALK
-
-INSTRUCTIONS = INSTRUCTIONS_HOSTED if HOSTED else INSTRUCTIONS_LOCAL
-
-
-# Friendly app names -> the command that launches them on Windows.
-APP_COMMANDS = {
-    "notepad": "notepad",
-    "calculator": "calc",
-    "calc": "calc",
-    "paint": "mspaint",
-    "file explorer": "explorer",
-    "explorer": "explorer",
-    "files": "explorer",
-    "command prompt": "cmd",
-    "cmd": "cmd",
-    "task manager": "taskmgr",
-    "wordpad": "write",
-}
-
-MACOS = sys.platform == "darwin"
-
-# The same friendly names on a Mac, where apps are launched by name with `open -a`.
-APP_COMMANDS_MAC = {
-    "notepad": "TextEdit",
-    "textedit": "TextEdit",
-    "wordpad": "TextEdit",
-    "notes": "Notes",
-    "calculator": "Calculator",
-    "calc": "Calculator",
-    "paint": "Preview",
-    "preview": "Preview",
-    "file explorer": "Finder",
-    "explorer": "Finder",
-    "files": "Finder",
-    "finder": "Finder",
-    "command prompt": "Terminal",
-    "cmd": "Terminal",
-    "terminal": "Terminal",
-    "task manager": "Activity Monitor",
-    "activity monitor": "Activity Monitor",
-    "music": "Music",
-    "safari": "Safari",
-}
-
-# Friendly site names -> their URLs.
-SITES = {
-    "gmail": "https://mail.google.com",
-    "google": "https://www.google.com",
-    "youtube": "https://www.youtube.com",
-    "maps": "https://maps.google.com",
-    "google maps": "https://maps.google.com",
-    "github": "https://github.com",
-    "chatgpt": "https://chatgpt.com",
-    "whatsapp": "https://web.whatsapp.com",
-    "facebook": "https://www.facebook.com",
-    "instagram": "https://www.instagram.com",
-    "twitter": "https://twitter.com",
-    "x": "https://x.com",
-    "spotify": "https://open.spotify.com",
-    "amazon": "https://www.amazon.com",
-    "wikipedia": "https://www.wikipedia.org",
-    "netflix": "https://www.netflix.com",
-    "reddit": "https://www.reddit.com",
-    "linkedin": "https://www.linkedin.com",
-}
-
-
-def _firecrawl_search(query: str) -> list[str]:
-    """Search the web through Firecrawl, returning the top results as text lines."""
-    api_key = os.getenv("FIRECRAWL_API_KEY")
-    body = json.dumps({"query": query, "limit": 5}).encode("utf-8")
-    req = urllib.request.Request(
-        FIRECRAWL_SEARCH_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
-    data = json.loads(raw)
-    results = []
-    for item in (data.get("data") or {}).get("web", []):
-        title = (item.get("title") or "").strip()
-        desc = (item.get("description") or "").strip()
-        line = f"{title}: {desc}" if title and desc else title or desc
-        if line:
-            results.append(line)
-    return results[:5]
-
-
-def _grab_screen_jpeg() -> bytes:
-    """Capture every monitor as one JPEG, shrunk for a fast upload."""
-    # Imported here, not at the top: a hosted server has no screen and no Pillow.
-    from PIL import Image, ImageGrab
-
-    img = ImageGrab.grab(all_screens=True).convert("RGB")
-    if img.width > SCREENSHOT_WIDTH:
-        height = round(img.height * SCREENSHOT_WIDTH / img.width)
-        img = img.resize((SCREENSHOT_WIDTH, height), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=85)
-    return buf.getvalue()
-
-
-def _ask_gemini_about_image(prompt: str, jpeg: bytes) -> str:
-    """Send an image and a question to Gemini, returning the answer as text."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ToolError(
-            "I can't see the screen, because no vision key is set up yet."
-        )
-    image = {
-        "type": "image",
-        "data": base64.b64encode(jpeg).decode(),
-        "mime_type": "image/jpeg",
-    }
-    why = "busy"
-    for attempt in range(2):
-        if attempt:
-            time.sleep(1.5)  # a spike in demand is usually over in a moment
-        for model in GEMINI_MODELS:
-            req = urllib.request.Request(
-                GEMINI_URL,
-                data=json.dumps(
-                    {"model": model, "input": [{"type": "text", "text": prompt}, image]}
-                ).encode("utf-8"),
-                method="POST",
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                    "Api-Revision": GEMINI_API_REVISION,
-                },
-            )
-            try:
-                raw = urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT).read()
-            except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "ignore")[:200]
-                logger.warning("Gemini %s failed: %s %s", model, e.code, detail)
-                if e.code in (401, 403):
-                    raise ToolError(
-                        "The vision key was rejected, so I can't see the screen."
-                    )
-                # 503 and 429 mean this model is overloaded; another usually isn't
-                why = f"error {e.code}"
-                continue
-            except OSError as e:  # timeout, DNS, connection reset
-                logger.warning("Gemini %s unreachable: %s", model, e)
-                why = "no answer"
-                continue
-            # The answer is the text blocks of the model's output step
-            blocks = [
-                block.get("text", "")
-                for step in json.loads(raw).get("steps", [])
-                for block in (step.get("content") or [])
-                if block.get("type") == "text"
-            ]
-            answer = " ".join(b.strip() for b in blocks if b.strip())
-            if answer:
-                logger.info("look_at_screen answered by %s", model)
-                return answer
-            why = "an empty answer"
-    raise ToolError(f"I couldn't get a look at the screen just now ({why}).")
-
-
-def _github_get(path: str):
-    """GET a GitHub API path and return the parsed JSON."""
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": AGENT_NAME}
-    token = os.getenv("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(f"{GITHUB_API}{path}", headers=headers)
-    try:
-        raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise ToolError("I couldn't find that repository on GitHub.")
-        if e.code in (401, 403):
-            raise ToolError(
-                "GitHub turned that request down, which usually means too many requests "
-                "in one hour. It should work again shortly."
-            )
-        raise ToolError(f"GitHub returned an error, code {e.code}.")
-    return json.loads(raw)
-
-
-def _parse_repo(text: str) -> str:
-    """Turn what someone said or pasted into an "owner/name" repository slug."""
-    t = text.strip()
-    t = re.sub(r"^https?://", "", t, flags=re.I)
-    t = re.sub(r"^(www\.)?github\.com/", "", t, flags=re.I)
-    # Spoken aloud, "owner/repo" arrives as "owner slash repo" or just "owner repo"
-    t = re.sub(r"\s*\bslash\b\s*", "/", t, flags=re.I)
-    t = t.strip("/ ").removesuffix(".git")
-    if "/" not in t:
-        t = re.sub(r"\s+", "/", t, count=1)
-    # Anything after owner/name (like a /pulls path) is dropped
-    parts = [p.strip() for p in t.split("/") if p.strip()][:2]
-    if len(parts) != 2:
-        raise ToolError(
-            "I need both the owner and the repository name, like facebook slash react."
-        )
-    return "/".join(parts)
-
-
-def _say_count(n: int) -> str:
-    """Round a big number to something that sounds natural spoken aloud."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}".removesuffix(".0") + " million"
-    if n >= 1000:
-        return f"{n / 1000:.1f}".removesuffix(".0") + " thousand"
-    return str(n)
-
-
-def _ago(iso: str) -> str:
-    """Describe a GitHub timestamp in words, like "today" or "3 days ago"."""
-    try:
-        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    except ValueError:
-        return "recently"
-    days = (datetime.now(tz=when.tzinfo) - when).days
-    if days <= 0:
-        return "today"
-    if days == 1:
-        return "yesterday"
-    if days < 30:
-        return f"{days} days ago"
-    if days < 365:
-        months = days // 30
-        return "last month" if months == 1 else f"{months} months ago"
-    years = days // 365
-    return "about a year ago" if years == 1 else f"about {years} years ago"
-
-
-def _ddg_search(query: str) -> list[str]:
-    """Fetch the top result snippets from DuckDuckGo's lightweight endpoint."""
-    url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    )
-    raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "ignore")
-    snippets = re.findall(r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", raw, re.S)
-    cleaned = [html.unescape(re.sub("<[^>]+>", "", s)).strip() for s in snippets]
-    return [s for s in cleaned if s][:5]
-
-
-def _web_search(query: str) -> list[str]:
-    """Search with Firecrawl when a key is configured, else fall back to DuckDuckGo."""
-    if os.getenv("FIRECRAWL_API_KEY"):
-        try:
-            results = _firecrawl_search(query)
-            if results:
-                return results
-            logger.warning("Firecrawl returned no results; falling back to DuckDuckGo")
-        except Exception as e:
-            logger.warning("Firecrawl search failed (%s); falling back to DuckDuckGo", e)
-    return _ddg_search(query)
 
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions=INSTRUCTIONS.format(name=ASSISTANT_NAME),
-            # Lets the agent hang up after saying goodbye, but not during the greeting
             tools=[EndCallTool(ignore_on_enter=True)],
         )
-        # A Playwright browser we drive: plays/pauses YouTube and reads pages.
-        # A persistent profile keeps logins (like Gmail) between runs.
         self._pw = None
         self._ctx = None
         self._page = None
+        self._draft: dict[str, str] | None = None
 
     async def on_enter(self) -> None:
-        # A fixed greeting is spoken right away, without waiting on the LLM
         self.session.say(GREETING)
 
     def _require_local(self, what: str) -> None:
-        # Tools that drive this computer only make sense when the agent runs on the
-        # user's own machine. When HOSTED, refuse politely instead of acting on the server.
         if HOSTED:
             raise ToolError(
                 f"I can't {what} from here, since I'm running on a server. "
                 "I can still answer questions or look things up for you."
             )
+
+    # --- Time ---
 
     @function_tool
     async def get_current_time(self, timezone: str) -> str:
@@ -487,6 +115,8 @@ class Assistant(Agent):
         meridiem = "AM" if now.hour < 12 else "PM"
         return f"It's {hour}:{now:%M} {meridiem} on {now:%A, %B} {now.day} in {timezone}."
 
+    # --- Music / YouTube ---
+
     @function_tool
     async def play_song(self, song: str) -> str:
         """Open Spotify in the web browser to play a song.
@@ -495,16 +125,11 @@ class Assistant(Agent):
             song: The song to play, like "Numb by Linkin Park" or "Bohemian Rhapsody"
         """
         self._require_local("open Spotify")
-        # Opens the Spotify web player at a search for this song, in the user's
-        # default browser (where they are signed in). They press play on the result.
         url = "https://open.spotify.com/search/" + urllib.parse.quote(song)
         webbrowser.open(url)
         return f"Opening Spotify for {song}. Press play on the top result."
 
     async def _browser_page(self):
-        # Start a Playwright browser the first time it's needed, and reuse it.
-        # launch_persistent_context stores cookies in a profile folder, so a site
-        # you sign into (like Gmail) stays signed in the next time.
         if self._page is not None:
             return self._page
         if async_playwright is None:
@@ -530,7 +155,6 @@ class Assistant(Agent):
         page = await self._browser_page()
         url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(song)
         await page.goto(url)
-        # Dismiss the cookie/consent dialog if YouTube shows one.
         for label in ("Accept all", "Reject all", "I agree"):
             try:
                 btn = page.get_by_role("button", name=label)
@@ -539,7 +163,6 @@ class Assistant(Agent):
                     break
             except Exception:
                 pass
-        # Clicking the first result is also the gesture that lets it play with sound.
         await page.wait_for_selector("ytd-video-renderer a#video-title", timeout=20000)
         await page.locator("ytd-video-renderer a#video-title").first.click()
         return f"Playing {song} on YouTube."
@@ -553,7 +176,6 @@ class Assistant(Agent):
         """
         self._require_local("play YouTube")
         page = await self._browser_page()
-        # Search filtered to channels (sp=EgIQAg%3D%3D), then open that channel.
         await page.goto(
             "https://www.youtube.com/results?search_query="
             + urllib.parse.quote(channel) + "&sp=EgIQAg%3D%3D"
@@ -570,14 +192,12 @@ class Assistant(Agent):
         href = await page.locator("ytd-channel-renderer a#main-link").first.get_attribute("href")
         if not href:
             raise ToolError(f"Couldn't find a channel called {channel}.")
-        # The Videos tab lists newest first, so the first item is the latest upload.
         await page.goto("https://www.youtube.com" + href.rstrip("/") + "/videos")
         newest = '#contents ytd-rich-item-renderer a[href*="/watch"]'
         await page.wait_for_selector(newest, timeout=20000)
         await page.locator(newest).first.click()
         await page.wait_for_selector("video", timeout=20000)
 
-        # YouTube is a single-page app: wait for the tab title to become the video's.
         title = ""
         try:
             await page.wait_for_function(
@@ -595,7 +215,6 @@ class Assistant(Agent):
         """Pause the playing YouTube video. Call this whenever the user says pause or stop."""
         if self._page is None:
             raise ToolError("Nothing is playing yet.")
-        # Prefer YouTube's own player API; fall back to the raw video element.
         await self._page.evaluate(
             "const p = document.getElementById('movie_player');"
             "if (p && p.pauseVideo) { p.pauseVideo(); }"
@@ -625,9 +244,10 @@ class Assistant(Agent):
         try:
             await self._page.locator("a.ytp-next-button").first.click(timeout=3000)
         except Exception:
-            # Fall back to YouTube's keyboard shortcut for "next".
             await self._page.keyboard.press("Shift+KeyN")
         return "Skipping to the next one."
+
+    # --- Apps / websites ---
 
     @function_tool
     async def open_app(self, app: str) -> str:
@@ -663,11 +283,12 @@ class Assistant(Agent):
         elif "." in key and " " not in key:
             url = key if key.startswith("http") else "https://" + key
         else:
-            # Unknown name: fall back to a Google search for it.
             url = "https://www.google.com/search?q=" + urllib.parse.quote(site)
         webbrowser.open(url)
         logger.info("open_website: %s", url)
         return f"Opening {site}."
+
+    # --- Web search ---
 
     @function_tool
     async def web_search(self, query: str) -> str:
@@ -686,6 +307,70 @@ class Assistant(Agent):
         logger.info("web_search: %s (%d results)", query, len(results))
         return "Top web results:\n- " + "\n- ".join(results)
 
+    # --- Email ---
+
+    @function_tool
+    async def draft_email(self, to: str, subject: str, body: str) -> str:
+        """Write an email and hold it for approval. This does NOT send anything.
+
+        Always call this first when someone wants to send an email. Then read the
+        draft back to them and ask whether to send it.
+
+        Args:
+            to: Who it's for: "me", or an address like "sam@example.com".
+            subject: A short subject line.
+            body: What the email should say, in full sentences.
+        """
+        self._require_local("send email")
+        address = contact_email(to)
+        if not body.strip():
+            raise ToolError("The email needs something in it. What should it say?")
+        self._draft = {
+            "to": address,
+            "subject": subject.strip() or "(no subject)",
+            "body": body.strip(),
+        }
+        in_gmail = ""
+        try:
+            uid = await asyncio.to_thread(
+                save_gmail_draft, address, self._draft["subject"], self._draft["body"]
+            )
+            self._draft["uid"] = uid or ""
+            in_gmail = " It's saved in their Gmail drafts, so they can check it there."
+        except Exception as e:
+            logger.warning("couldn't save the draft to Gmail: %s", e)
+        logger.info("draft_email: to %s", address)
+        return (
+            f"Drafted, NOT yet sent. To: {address}. Subject: {self._draft['subject']}. "
+            f"Body: {self._draft['body']}{in_gmail}\n"
+            "Read this back to them and ask whether to send it. Only call send_email "
+            "once they have clearly said yes."
+        )
+
+    @function_tool
+    async def send_email(self) -> str:
+        """Send the email that draft_email prepared.
+
+        Only call this after reading the draft back to the user and hearing a clear
+        yes. If they want anything changed, call draft_email again instead.
+        """
+        self._require_local("send email")
+        if not self._draft:
+            raise ToolError("There's no draft ready. What should the email say?")
+        draft = self._draft
+        await asyncio.to_thread(
+            smtp_send, draft["to"], draft["subject"], draft["body"]
+        )
+        self._draft = None
+        if draft.get("uid"):
+            try:
+                await asyncio.to_thread(delete_gmail_draft, draft["uid"])
+            except Exception as e:
+                logger.warning("couldn't remove the saved Gmail draft: %s", e)
+        return f"Sent to {draft['to']}."
+
+    # --- Vision ---
+
     @function_tool
     async def look_at_screen(self, question: str) -> str:
         """Look at what's on the user's screen right now and answer about it.
@@ -699,20 +384,19 @@ class Assistant(Agent):
                 screen?" or "what does this code do?"
         """
         self._require_local("see your screen")
-        # The LLM sometimes passes junk like ":" instead of the real question
         if len(re.sub(r"[^a-z]", "", question.lower())) < 3:
             question = "What is on the screen?"
-        # Don't speak a filler line here: on speakers the mic hears it, the STT
-        # transcribes it as the user, and that phantom turn interrupts the real answer.
-        jpeg = await asyncio.to_thread(_grab_screen_jpeg)
+        jpeg = await asyncio.to_thread(grab_screen_jpeg)
         prompt = (
             "This is a screenshot of the user's computer screen. Answer their question "
             "in one or two short sentences, written to be read aloud, with no markdown "
             f"or lists. Their question: {question}"
         )
-        answer = await asyncio.to_thread(_ask_gemini_about_image, prompt, jpeg)
+        answer = await asyncio.to_thread(ask_gemini_about_image, prompt, jpeg)
         logger.info("look_at_screen: %s (%d KB)", question, len(jpeg) // 1024)
         return answer
+
+    # --- GitHub ---
 
     @function_tool
     async def github_repo_summary(self, repo: str) -> str:
@@ -727,16 +411,14 @@ class Assistant(Agent):
             repo: The repository as "owner/name", like "facebook/react". A full GitHub
                 URL works too.
         """
-        slug = _parse_repo(repo)
+        slug = parse_repo(repo)
         info, pulls, contributors = await asyncio.gather(
-            asyncio.to_thread(_github_get, f"/repos/{slug}"),
+            asyncio.to_thread(github_get, f"/repos/{slug}"),
             asyncio.to_thread(
-                _github_get,
+                github_get,
                 f"/repos/{slug}/pulls?state=open&sort=updated&direction=desc&per_page=5",
             ),
-            asyncio.to_thread(_github_get, f"/repos/{slug}/contributors?per_page=5"),
-            # A repo with no commits has no contributors, and pulls can be restricted;
-            # neither should sink the whole summary.
+            asyncio.to_thread(github_get, f"/repos/{slug}/contributors?per_page=5"),
             return_exceptions=True,
         )
         if isinstance(info, BaseException):
@@ -750,10 +432,10 @@ class Assistant(Agent):
         lines = [
             f"{info.get('full_name', slug)}: {about}.",
             f"Mainly {info.get('language') or 'several languages'}, with "
-            f"{_say_count(info.get('stargazers_count', 0))} stars, "
-            f"{_say_count(info.get('forks_count', 0))} forks and "
-            f"{_say_count(info.get('open_issues_count', 0))} open issues and pull "
-            f"requests. Last pushed {_ago(info.get('pushed_at') or '')}.",
+            f"{say_count(info.get('stargazers_count', 0))} stars, "
+            f"{say_count(info.get('forks_count', 0))} forks and "
+            f"{say_count(info.get('open_issues_count', 0))} open issues and pull "
+            f"requests. Last pushed {ago(info.get('pushed_at') or '')}.",
         ]
         if pulls:
             lines.append("Open pull requests, most recently updated first:")
@@ -762,7 +444,7 @@ class Assistant(Agent):
                 draft = ", still a draft" if pr.get("draft") else ""
                 lines.append(
                     f"- number {pr.get('number')}, \"{pr.get('title')}\", opened by "
-                    f"{author} {_ago(pr.get('created_at') or '')}{draft}"
+                    f"{author} {ago(pr.get('created_at') or '')}{draft}"
                 )
         else:
             lines.append("It has no open pull requests right now.")
@@ -771,13 +453,15 @@ class Assistant(Agent):
                 "Top contributors: "
                 + ", ".join(
                     f"{c.get('login')} with "
-                    f"{_say_count(c.get('contributions', 0))} commits"
+                    f"{say_count(c.get('contributions', 0))} commits"
                     for c in contributors
                 )
                 + "."
             )
         logger.info("github_repo_summary: %s (%d open PRs)", slug, len(pulls))
         return "\n".join(lines)
+
+    # --- Browser / read page ---
 
     @function_tool
     async def read_page(self, site: str) -> str:
@@ -800,7 +484,7 @@ class Assistant(Agent):
         else:
             url = "https://www.google.com/search?q=" + urllib.parse.quote(site)
         await page.goto(url)
-        await page.wait_for_timeout(2500)  # let dynamic pages finish loading
+        await page.wait_for_timeout(2500)
         text = await page.evaluate("document.body ? document.body.innerText : ''")
         text = re.sub(r"\n{3,}", "\n\n", (text or "")).strip()
         if not text:
@@ -809,7 +493,6 @@ class Assistant(Agent):
         return f"Content from {site} (summarize the key points aloud):\n{text[:3000]}"
 
     async def aclose_browser(self) -> None:
-        # Close the Playwright browser when the agent shuts down.
         try:
             if self._ctx is not None:
                 await self._ctx.close()
@@ -819,12 +502,28 @@ class Assistant(Agent):
             pass
 
 
+# --- LLM provider ---
+
+
 def llm_gateway(model: str = LLM_MODEL) -> openai.LLM:
-    """An LLM served by AssemblyAI's LLM Gateway, through its OpenAI-compatible API."""
+    """The conversational LLM: OpenRouter when its key is set, else AssemblyAI's gateway.
+
+    Both speak the OpenAI API, so switching is only a different base URL and key.
+    """
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        logger.info("LLM: %s via OpenRouter", OPENROUTER_MODEL)
+        return openai.LLM(
+            model=OPENROUTER_MODEL, base_url=OPENROUTER_URL, api_key=openrouter_key
+        )
     api_key = os.getenv("ASSEMBLYAI_API_KEY")
     if not api_key:
         raise ValueError("Set ASSEMBLYAI_API_KEY in .env.local or the environment")
+    logger.info("LLM: %s via AssemblyAI", model)
     return openai.LLM(model=model, base_url=LLM_GATEWAY_URL, api_key=api_key)
+
+
+# --- Server ---
 
 
 server = AgentServer()
@@ -842,7 +541,6 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
     tts = assemblyai.TTS(voice=TTS_VOICE)
-    # Open the TTS connection now, so the greeting doesn't wait on the handshake
     tts.prewarm()
 
     session = AgentSession(
@@ -851,26 +549,16 @@ async def entrypoint(ctx: JobContext) -> None:
             mode=STT_MODE,
             vad_threshold=VAD_THRESHOLD,
             keyterms_prompt=STT_KEYTERMS,
-            # More building blocks, off by default. Each skill says when to use it.
-            # voice_focus="near-field",     # background noise: skills/voice-focus
-            # prompt="...",                 # what calls are about: skills/keyterms-and-prompt
-            # language_codes=["en", "es"],  # expected languages: skills/languages
-            # domain="medical-v1",          # medical vocabulary: skills/medical-mode
         ),
         llm=llm_gateway(),
         tts=tts,
         vad=ctx.proc.userdata["vad"],
         turn_handling=TurnHandlingOptions(
-            # Universal-3.6 Pro decides when the user has finished speaking...
             turn_detection="stt",
-            # ...so LiveKit shouldn't add its own delay on top
             endpointing={"min_delay": 0},
-            # A cough or an "uh-huh" pauses the reply instead of cutting it off
             interruption={"resume_false_interruption": True},
         ),
         tts_text_transforms=["filter_emoji", "filter_markdown"],
-        # When the user interrupts, keep only the words they heard in the chat history,
-        # using the TTS's word timings
         use_tts_aligned_transcript=True,
     )
 
@@ -880,7 +568,6 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(log_usage)
 
     assistant = Assistant()
-    # Make sure the YouTube browser is closed when the agent stops.
     ctx.add_shutdown_callback(assistant.aclose_browser)
 
     await session.start(agent=assistant, room=ctx.room)

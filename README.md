@@ -73,6 +73,12 @@ see `.env.local.example` for where to get them.
 | `FIRECRAWL_API_KEY` | Cleaner `web_search` results | Falls back to a DuckDuckGo scrape |
 | `GEMINI_API_KEY` | `look_at_screen` — answers questions about what's on screen | The tool says it can't see |
 | `GITHUB_TOKEN` | Private repos in `github_repo_summary`, 5000 calls/hour | Public repos only, 60/hour |
+| `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` | `draft_email` saves a real draft to Gmail; `send_email` sends it | Drafts are spoken aloud only |
+
+Email is deliberately two steps. `draft_email` writes the message into your Gmail
+Drafts folder over IMAP and sends nothing, so you can check it in Gmail on any
+device. `send_email` sends that draft over SMTP and removes the saved copy, and
+the agent is instructed to read the draft back and wait for a clear yes first.
 
 `look_at_screen` needs its own key because the models on AssemblyAI's free
 gateway plan don't accept images at all.
