@@ -1,0 +1,8 @@
+# Keep the image small and safe: never copy these into the container.
+.venv/
+.browser-profile/
+.env.local
+__pycache__/
+*.pyc
+.git/
+skills/

@@ -1,0 +1,15 @@
+.venv
+__pycache__
+*.pyc
+
+# Secrets: never commit real keys. .env.local.example is the template that is committed.
+.env.local
+.env
+
+# Playwright's logged-in browser profile
+.browser-profile
+
+# Local tool and OS state
+.refact
+.DS_Store
+Thumbs.db
