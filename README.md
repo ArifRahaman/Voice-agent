@@ -6,7 +6,24 @@ text-to-speech. You talk to it in your terminal.
 
 ```
 voice-agent/
-├── src/agent.py        The agent
+├── src/
+│   ├── agent.py        Entry point: starts the server and voice session
+│   ├── assistant.py    The assistant, built from the tool groups
+│   ├── config.py       Settings (voice, models, keys, app names)
+│   ├── prompts.py      Greeting and system instructions
+│   ├── tools/          What the assistant can do, one file per topic
+│   │   ├── base.py     Shared: hosted check, browser, site URLs
+│   │   ├── apps.py     open_app, open_website
+│   │   ├── clock.py    get_current_time
+│   │   ├── github.py   github_repo_summary
+│   │   ├── mail.py     draft_email, send_email
+│   │   ├── media.py    Spotify, YouTube, pause / resume / next
+│   │   ├── system.py   volume, brightness, lock, battery, DND, typing
+│   │   ├── vision.py   look_at_screen
+│   │   └── web.py      web_search, read_page
+│   └── services/       The code behind the tools
+│       ├── email.py, github.py, search.py, vision.py
+│       └── system/     mac.py, windows.py, ubuntu.py (picked by OS)
 ├── .env.local          Your key (git-ignored)
 ├── .env.local.example  Template
 ├── requirements.txt    Dependencies (pip)
@@ -104,7 +121,7 @@ but it's a mitigation, not a cure.
 
 ## What you can change
 
-Each setting at the top of `src/agent.py` has a short comment:
+Each setting in `src/config.py` has a short comment:
 
 - `TTS_VOICE` / `ASSISTANT_NAME` — the voice and the name it introduces itself with.
 - `STT_MODE` — `"min_latency"`, `"balanced"`, or `"max_accuracy"`.
